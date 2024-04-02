@@ -1,4 +1,4 @@
-C:\Users\sofia\hello-world\hello-world\backend\backend\src\main\java\com\example\App.java
-C:\Users\sofia\hello-world\hello-world\backend\backend\src\main\java\com\example\config\WebSocketConfig.java
-C:\Users\sofia\hello-world\hello-world\backend\backend\src\main\java\com\example\HelloController.java
-C:\Users\sofia\hello-world\hello-world\backend\backend\src\main\java\com\example\websocket\AudioWebSocketHandler.java
+/home/bence/stream_audio/backend/backend/src/main/java/com/example/config/WebSocketConfig.java
+/home/bence/stream_audio/backend/backend/src/main/java/com/example/App.java
+/home/bence/stream_audio/backend/backend/src/main/java/com/example/websocket/AudioWebSocketHandler.java
+/home/bence/stream_audio/backend/backend/src/main/java/com/example/HelloController.java

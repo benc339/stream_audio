@@ -30,6 +30,12 @@
         <artifactId>client-sdk</artifactId>
         <version>1.36.0</version>
       </dependency>
+      <dependency>
+        <groupId>org.bytedeco</groupId>
+        <artifactId>ffmpeg-platform</artifactId>
+        <version>4.4-1.5.6</version>
+    </dependency>
+
 
 
     </dependencies>
