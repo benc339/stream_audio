@@ -21,8 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-
-
+import java.util.concurrent.TimeUnit;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -41,9 +40,6 @@ import org.bytedeco.ffmpeg.avformat.AVIOContext;
 import org.bytedeco.ffmpeg.avformat.AVStream;
 import org.bytedeco.ffmpeg.avutil.AVFrame;
 
-import static org.bytedeco.javacpp.avcodec.*;
-import static org.bytedeco.javacpp.avformat.*;
-import static org.bytedeco.javacpp.avutil.*;
 
 public class AudioWebSocketHandler extends BinaryWebSocketHandler {
     private static final Logger logger = LoggerFactory.getLogger(AudioWebSocketHandler.class);
@@ -58,6 +54,9 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
 
     private List<byte[]> audioChunks = new ArrayList<>();
 
+    private List<byte[]> pcmChunks = new ArrayList<>();
+    private int chunkCount = 0;
+
     public AudioWebSocketHandler() {
         try {
             System.setProperty("com.microsoft.cognitiveservices.speech.debug", "true");
@@ -68,17 +67,37 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
 
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) throws Exception {
-        byte[] audioData = message.getPayload().array();
+        byte[] webMData = message.getPayload().array();
+        logger.info("Received WebM data chunk: {} bytes", webMData.length);
+        // Convert WebM chunk to PCM
         
-        System.out.println("Received audio data size: " + audioData.length + " bytes");
-    
-        // Convert WebM to PCM in memory
-        byte[] pcmDataBytes = convertWebMToPCMInMemory(audioData);
-        System.out.println("Converted PCM data size: " + pcmDataBytes.length + " bytes");
-    
-        // Now that we have the PCM data in memory, transcribe it
-        transcribePcmData(session, pcmDataBytes);
+        byte[] pcmData = convertWebMToPCMInMemory(webMData);
+        pcmChunks.add(pcmData);
+        chunkCount++;
+
+        if (chunkCount >= 20) {
+            logger.info("Combining PCM chunks");
+            combinePCMChunks(session);
+            pcmChunks.clear();
+            chunkCount = 0;
+        }
     }
+
+    private void combinePCMChunks(WebSocketSession session) {
+        // Combine the PCM chunks into a single byte array
+        int totalSize = pcmChunks.stream().mapToInt(chunk -> chunk.length).sum();
+        byte[] combinedPcmData = new byte[totalSize];
+        int offset = 0;
+        for (byte[] chunk : pcmChunks) {
+            System.arraycopy(chunk, 0, combinedPcmData, offset, chunk.length);
+            offset += chunk.length;
+        }
+
+        // Perform transcription on the combined PCM data
+        transcribePcmData(session, combinedPcmData);
+    }
+
+
     
     private byte[] convertWebMToPCMInMemory(byte[] webMData) throws IOException, InterruptedException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
@@ -89,26 +108,46 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
             "-f", "s16le", // PCM format s16le (signed 16-bit little endian)
             "-acodec", "pcm_s16le", // Set audio codec to PCM signed 16-bit little endian
             "-ar", "16000", // Sample rate 16000 Hz
-            "-ac", "1", // Number of audio channels
+            "-ac", "2", // Number of audio channels
             "pipe:1" // Write output to stdout
         );
         
         Process process = processBuilder.start();
         
         try (OutputStream ffmpegInput = process.getOutputStream();
-             InputStream ffmpegOutput = process.getInputStream()) {
+             InputStream ffmpegOutput = process.getInputStream();
+             InputStream ffmpegError = process.getErrorStream()) {
             
             // Write the WebM data to FFmpeg's input stream
             ffmpegInput.write(webMData);
             ffmpegInput.flush();
             ffmpegInput.close();
             
-            // Read the PCM data from FFmpeg's output stream
-            byte[] buffer = new byte[4096];
-            int bytesRead;
-            while ((bytesRead = ffmpegOutput.read(buffer)) != -1) {
-                outputStream.write(buffer, 0, bytesRead);
+            // Read the PCM data from FFmpeg's output stream in a separate thread
+            Thread outputThread = new Thread(() -> {
+                try {
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    while ((bytesRead = ffmpegOutput.read(buffer)) != -1) {
+                        outputStream.write(buffer, 0, bytesRead);
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+            outputThread.start();
+            
+            // Capture and print FFmpeg's stderr output
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(ffmpegError))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.err.println(line);
+                }
             }
+            
+            // Wait for the output thread to finish
+            outputThread.join();
+            
         }
         
         int exitCode = process.waitFor();
@@ -120,7 +159,7 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
         
         return outputStream.toByteArray();
     }
-
+    
     public void convertWebMToPCM(String webMFilePath, String pcmFilePath) {
         ProcessBuilder processBuilder = new ProcessBuilder(
             "ffmpeg", "-i", webMFilePath, 
@@ -315,42 +354,7 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
 
     }
  
-    private int getTotalAudioDuration() {
-        int totalSize = audioChunks.stream().mapToInt(chunk -> chunk.length).sum();
-        int sampleRate = 16000;
-        int bytesPerSample = 2;
-        int channelCount = 1;
-        int totalSamples = totalSize / (bytesPerSample * channelCount);
-        return totalSamples / sampleRate;
-    }
 
-    private void processAudioData(WebSocketSession session) {
-        // Combine the audio chunks into a single byte array
-        int totalSize = audioChunks.stream().mapToInt(chunk -> chunk.length).sum();
-        byte[] combinedAudioData = new byte[totalSize];
-        int offset = 0;
-        for (byte[] chunk : audioChunks) {
-            System.arraycopy(chunk, 0, combinedAudioData, offset, chunk.length);
-            offset += chunk.length;
-        }
-
-        // Create an AudioInputStream from the combined audio data
-        ByteArrayInputStream bais = new ByteArrayInputStream(combinedAudioData);
-        AudioFormat format = new AudioFormat(16000, 16, 1, true, false);
-        AudioInputStream audioInputStream = new AudioInputStream(bais, format, combinedAudioData.length / format.getFrameSize());
-
-        // Save the WAV file
-        String fileName = "output.wav";
-        try {
-            AudioSystem.write(audioInputStream, AudioFileFormat.Type.WAVE, new File(fileName));
-            logger.info("WAV file saved successfully: {}", fileName);
-        } catch (IOException e) {
-            logger.error("Error saving WAV file: {}", e.getMessage());
-        }
-
-        // Perform speech recognition on the combined audio data
-        recognizeSpeech(session, combinedAudioData);
-    }
 
     private void recognizeSpeech(WebSocketSession session, byte[] audioData) {
         try {

@@ -5,12 +5,13 @@ const AudioStreamer: React.FC = () => {
   const [recognizedText, setRecognizedText] = useState('');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  console.log('start');
 
   useEffect(() => {
     const connectWebSocket = () => {
       socketRef.current = new WebSocket('ws://localhost:8080/audio');
       socketRef.current.onopen = () => {
-        console.log('WebSocket connection established');
+        console.log('WebSocket connection established 2');
       };
       socketRef.current.onmessage = (event) => {
         const receivedText = event.data;
@@ -33,58 +34,11 @@ const AudioStreamer: React.FC = () => {
     };
   }, []);
 
-  // Define a type for the WAV header writing function parameters
-  type DataViewWithString = {
-    view: DataView;
-    offset: number;
-    string: string;
-  };
-
-  // Helper function to write strings to the DataView
-  const writeString = ({ view, offset, string }: DataViewWithString): void => {
-    for (let i = 0; i < string.length; i++) {
-      view.setUint8(offset + i, string.charCodeAt(i));
-    }
-  };
-
-  // Define a type for the bufferToWav function parameters
-  interface BufferToWavParams {
-    audioBuffer: Float32Array;
-    sampleRate: number;
-  }
-
-  // Helper function to convert audio buffer to WAV format
-  const bufferToWav = ({ audioBuffer, sampleRate }: BufferToWavParams): ArrayBuffer => {
-    const buffer = new ArrayBuffer(44 + audioBuffer.length * 2);
-    const view = new DataView(buffer);
-
-    // Write WAV header
-    writeString({ view, offset: 0, string: 'RIFF' }); // RIFF header
-    view.setUint32(4, 36 + audioBuffer.length * 2, true); // file length
-    writeString({ view, offset: 8, string: 'WAVE' }); // WAVE header
-    writeString({ view, offset: 12, string: 'fmt ' }); // fmt chunk
-    view.setUint32(16, 16, true); // size of fmt chunk
-    view.setUint16(20, 1, true); // audio format (1 is PCM)
-    view.setUint16(22, 1, true); // number of channels
-    view.setUint32(24, sampleRate, true); // sample rate
-    view.setUint32(28, sampleRate * 2, true); // byte rate (sampleRate * numChannels * bitsPerSample/8)
-    view.setUint16(32, 2, true); // block align (numChannels * bitsPerSample/8)
-    view.setUint16(34, 16, true); // bits per sample
-    writeString({ view, offset: 36, string: 'data' }); // data chunk header
-    view.setUint32(40, audioBuffer.length * 2, true); // data chunk length
-
-    // Write audio data
-    let offset = 44;
-    for (let i = 0; i < audioBuffer.length; i++, offset += 2) {
-      const val = Math.max(-1, Math.min(1, audioBuffer[i]));
-      view.setInt16(offset, val < 0 ? val * 0x8000 : val * 0x7FFF, true);
-    }
-
-    return buffer;
-  };
 
   const startAudioCapture = async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        channelCount: 1 // Specify mono audio
+    } });
 
     const audioContext = new AudioContext({ sampleRate: 16000 });
 
@@ -95,30 +49,19 @@ const AudioStreamer: React.FC = () => {
     sourceNode.connect(destinationNode);
 
     const options = {
-      mimeType: 'audio/webm;codecs=pcm',
+      mimeType: 'audio/webm; codecs=pcm',
       audioBitsPerSecond: 256000,
     };
 
     mediaRecorderRef.current = new MediaRecorder(destinationNode.stream, options);
 
-    const chunks: Blob[] = [];
-
     mediaRecorderRef.current.ondataavailable = (event) => {
-      chunks.push(event.data);
       if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        console.log('Send data');
         socketRef.current.send(event.data);
       }
     };
 
-    mediaRecorderRef.current.onstop = async () => {
-
-
-      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-        //socketRef.current.send(event.data);
-      }
-
-
-    };
 
     mediaRecorderRef.current.start();
     setIsRecording(true);
@@ -133,7 +76,7 @@ const AudioStreamer: React.FC = () => {
         }
       };
 
-      const timer = setTimeout(stopRecording, 2000); // Stop recording after 5 seconds
+      const timer = setTimeout(stopRecording, 1000); // Stop recording after 5 seconds
 
       return () => {
         clearTimeout(timer);
