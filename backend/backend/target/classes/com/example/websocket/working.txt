@@ -1,0 +1,77 @@
+
+    protected void handleBinaryMessageWorking(WebSocketSession session, BinaryMessage message) throws Exception {
+        ByteBuffer byteBuffer = message.getPayload();
+        float[] floatData = new float[byteBuffer.remaining() / 4];
+        byteBuffer.asFloatBuffer().get(floatData);
+        // User is still talking
+        logger.info("Received WebM data chunk: {} bytes", floatData.length);
+
+        if (chunkCount == 0) {
+            waveFilePath = "output"+session.getId().toString()+".wav";
+            logger.info(waveFilePath);
+            startFFmpegProcessToCreateWav();
+        } 
+        if (isTalking) {
+            feedDataToFFmpeg(floatData);
+            chunkCount++;
+        }
+    }
+
+
+    protected void handleTextMessageWorking(WebSocketSession session, TextMessage message) {
+        logger.info(message.getPayload());
+        try {
+            String messageData = message.getPayload();
+
+            if (messageData.equals("start")) {
+                // User started talking
+                chunkCount = 0; // Reset chunk count
+                isTalking = true;
+                logger.info("User started talking. Chunk count reset.");
+            } else if (messageData.equals("stop")) {
+                isTalking = false;
+                // User stopped talking
+                stopFFmpegProcess();
+                transcribeWavFile(session);
+
+                // Delete the WAV file after transcribing
+                File wavFile = new File(waveFilePath);
+                if (wavFile.exists()) {
+                    wavFile.delete();
+                }
+                waveFilePath = ""; // Reset the wavFilePath
+            }
+        } catch (Exception e) {
+            logger.error("Error handling text message", e);
+        }
+    }
+
+    public void startFFmpegProcessToCreateWav() throws IOException {
+        ProcessBuilder processBuilder = new ProcessBuilder(
+            "ffmpeg",
+            "-f", "f32le",  // Input format: 32-bit little-endian floating-point raw audio
+            "-ar", "16000",  // Sample rate: 16000 Hz
+            "-ac", "1",  // Audio channels: 1 (mono)
+            "-i", "pipe:0",  // Input from stdin
+            "-f", "wav",  // Output format: WAV
+            "-acodec", "pcm_s16le",  // Output audio codec: 16-bit little-endian PCM
+            "-ar", "16000",  // Output sample rate: 16000 Hz
+            "-ac", "1",  // Output audio channels: 1 (mono)
+            waveFilePath  // Output file path
+        );
+        ffmpegProcess = processBuilder.start();
+        ffmpegInput = ffmpegProcess.getOutputStream();
+    
+        // Start a new thread to log FFmpeg output
+        new Thread(() -> {
+            try (InputStreamReader isr = new InputStreamReader(ffmpegProcess.getErrorStream());
+                 BufferedReader reader = new BufferedReader(isr)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("FFmpeg: " + line);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }

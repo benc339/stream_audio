@@ -1,0 +1,110 @@
+    private byte[] convertWebMToPCMInMemory(byte[] webMData) throws IOException, InterruptedException {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        
+        ProcessBuilder processBuilder = new ProcessBuilder(
+            "ffmpeg",
+            "-i", "pipe:0", // Read input from stdin
+            "-f", "s16le", // PCM format s16le (signed 16-bit little endian)
+            "-acodec", "pcm_s16le", // Set audio codec to PCM signed 16-bit little endian
+            "-ar", "16000", // Sample rate 16000 Hz
+            "-ac", "1", // Number of audio channels
+            "pipe:1" // Write output to stdout
+        );
+        
+        Process process = processBuilder.start();
+        
+        try (OutputStream ffmpegInput = process.getOutputStream();
+             InputStream ffmpegOutput = process.getInputStream();
+             InputStream ffmpegError = process.getErrorStream()) {
+            
+            // Write the WebM data to FFmpeg's input stream
+            ffmpegInput.write(webMData);
+            ffmpegInput.flush();
+            ffmpegInput.close();
+            
+            // Read the PCM data from FFmpeg's output stream in a separate thread
+            Thread outputThread = new Thread(() -> {
+                try {
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    while ((bytesRead = ffmpegOutput.read(buffer)) != -1) {
+                        outputStream.write(buffer, 0, bytesRead);
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+            outputThread.start();
+            
+            // Capture and print FFmpeg's stderr output
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(ffmpegError))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.err.println(line);
+                }
+            }
+            
+            // Wait for the output thread to finish
+            outputThread.join();
+            
+        }
+        
+        int exitCode = process.waitFor();
+        if (exitCode == 0) {
+            System.out.println("In-memory conversion successful");
+        } else {
+            System.err.println("In-memory conversion failed");
+        }
+        
+        return outputStream.toByteArray();
+    }
+    
+    public void convertWebMToPCM(String webMFilePath, String pcmFilePath) {
+        ProcessBuilder processBuilder = new ProcessBuilder(
+            "ffmpeg", "-i", webMFilePath, 
+            "-f", "s16le", // PCM format s16le (signed 16-bit little endian)
+            "-acodec", "pcm_s16le", // Set audio codec to PCM signed 16-bit little endian
+            "-ar", "16000", // Sample rate 16000 Hz
+            "-ac", "1", // Number of audio channels
+            pcmFilePath);
+        try {
+            Process process = processBuilder.start();
+            int exitCode = process.waitFor();
+            if (exitCode == 0) {
+                System.out.println("Conversion successful");
+            } else {
+                System.err.println("Conversion failed");
+            }
+        } catch (IOException | InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+
+
+    private void recognizeSpeech(WebSocketSession session, byte[] audioData) {
+        try {
+            SpeechConfig speechConfig = SpeechConfig.fromSubscription(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION);
+            speechConfig.setSpeechRecognitionLanguage("en-US");
+
+            AudioStreamFormat audioFormat = AudioStreamFormat.getWaveFormatPCM((long)16000, (short)16, (short)1);
+            PushAudioInputStream pushStream = PushAudioInputStream.createPushStream(audioFormat);
+
+            pushStream.write(audioData);
+            pushStream.close();
+
+            AudioConfig audioConfig = AudioConfig.fromStreamInput(pushStream);
+            SpeechRecognizer recognizer = new SpeechRecognizer(speechConfig, audioConfig);
+            Future<SpeechRecognitionResult> task = recognizer.recognizeOnceAsync();
+            SpeechRecognitionResult result = task.get();
+
+            if (result.getReason() == ResultReason.RecognizedSpeech) {
+                String recognizedText = result.getText();
+                session.sendMessage(new org.springframework.web.socket.TextMessage(recognizedText));
+            } else {
+                logger.warn("Speech recognition failed: {}", result.getReason());
+            }
+        } catch (InterruptedException | ExecutionException | IOException e) {
+            logger.error("Error during speech recognition: {}", e.getMessage());
+        }
+    }

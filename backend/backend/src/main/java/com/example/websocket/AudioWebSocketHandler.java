@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.BinaryWebSocketHandler;
 
@@ -21,9 +22,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -56,6 +59,65 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
 
     private List<byte[]> pcmChunks = new ArrayList<>();
     private int chunkCount = 0;
+    
+    private Process ffmpegProcess;
+    private OutputStream ffmpegInput;
+
+    private static Semaphore stopTranslationWithFileSemaphore;
+
+    private SpeechRecognizer recognizer;
+
+    private String waveFilePath;
+    
+    private boolean isTalking;
+
+    private ByteArrayOutputStream pcmOutputStream;
+
+    private String pcmFilePath;
+
+    private List<Float> combinedFloatData = new ArrayList<>();
+
+    private PushAudioInputStream pushStream;
+
+    private FileOutputStream pcmFileOutputStream;
+
+    private static final int BITS_PER_SAMPLE = 16;
+    private static final boolean IS_LITTLE_ENDIAN = true;
+
+    public void feedDataToFFmpeg(float[] data) throws IOException {
+        if (ffmpegInput != null) {
+            byte[] byteData = new byte[data.length * 4];  // Each float is 4 bytes
+            ByteBuffer.wrap(byteData).asFloatBuffer().put(data);
+            ffmpegInput.write(byteData);
+            ffmpegInput.flush();  // Ensure data is sent to FFmpeg
+        }
+    }
+
+    private void startFFmpegProcess() throws IOException {
+        ProcessBuilder processBuilder = new ProcessBuilder(
+            "ffmpeg",
+            "-f", "f32le", // Float32 little endian format
+            "-ar", "16000", // Sample rate 16000 Hz
+            "-ac", "1", // Number of audio channels
+            "-i", "pipe:0", // Read input from stdin
+            "-f", "s16le", // PCM format s16le (signed 16-bit little endian)
+            "-acodec", "pcm_s16le", // Set audio codec to PCM signed 16-bit little endian
+            "-ar", "16000", // Sample rate 16000 Hz
+            "-ac", "1", // Number of audio channels
+            "pipe:1" // Write output to stdout
+        );
+        ffmpegProcess = processBuilder.start();
+        ffmpegInput = ffmpegProcess.getOutputStream();
+    }
+
+    private void stopFFmpegProcess() throws IOException {
+        if (ffmpegProcess != null) {
+            ffmpegInput.close(); // Signal FFmpeg to finish
+            ffmpegProcess.destroy(); // Terminate the FFmpeg process
+            ffmpegProcess = null;
+            ffmpegInput = null;
+        }
+    }
 
     public AudioWebSocketHandler() {
         try {
@@ -63,223 +125,184 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
         } catch (Exception e) {
             logger.error("Error initializing Azure Speech SDK: {}", e.getMessage());
         }
-    }
+    }    
+
 
     @Override
     protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) throws Exception {
-        byte[] webMData = message.getPayload().array();
-        logger.info("Received WebM data chunk: {} bytes", webMData.length);
-        // Convert WebM chunk to PCM
-        
-        byte[] pcmData = convertWebMToPCMInMemory(webMData);
-        pcmChunks.add(pcmData);
-        chunkCount++;
+        ByteBuffer byteBuffer = message.getPayload();
+        float[] floatData = new float[byteBuffer.remaining() / 4];
+        byteBuffer.asFloatBuffer().get(floatData);
 
-        if (chunkCount >= 20) {
-            logger.info("Combining PCM chunks");
-            combinePCMChunks(session);
-            pcmChunks.clear();
-            chunkCount = 0;
+
+        if (isTalking) {
+            byte[] pcmData = convertFloatArrayToPCMInMemory(floatData);
+            pushStream.write(pcmData);
+      
+            // Write the PCM data to the file
+            if (pcmFileOutputStream != null) {
+                //pcmFileOutputStream.write(pcmData);
+            }
         }
     }
 
-    private void combinePCMChunks(WebSocketSession session) {
-        // Combine the PCM chunks into a single byte array
-        int totalSize = pcmChunks.stream().mapToInt(chunk -> chunk.length).sum();
-        byte[] combinedPcmData = new byte[totalSize];
-        int offset = 0;
-        for (byte[] chunk : pcmChunks) {
-            System.arraycopy(chunk, 0, combinedPcmData, offset, chunk.length);
-            offset += chunk.length;
-        }
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        logger.info(message.getPayload());
+        try {
+            String messageData = message.getPayload();
+            if (messageData.equals("start")) {
+                startSpeechRecognition(session);
+                isTalking = true;
+                pcmFilePath = "output" + session.getId().toString() + ".pcm";
+                logger.info("User started talking. Chunk count reset.");
 
-        // Perform transcription on the combined PCM data
-        transcribePcmData(session, combinedPcmData);
+                // Open the PCM file for writing
+                pcmFileOutputStream = new FileOutputStream(pcmFilePath);
+            } else if (messageData.equals("stop")) {
+                isTalking = false;
+                stopSpeechRecognition();
+
+                // Close the PCM file
+                if (pcmFileOutputStream != null) {
+                    pcmFileOutputStream.close();
+                    pcmFileOutputStream = null;
+                }
+
+                // Delete the PCM file after transcribing
+                File pcmFile = new File(pcmFilePath);
+                if (pcmFile.exists()) {
+                    //pcmFile.delete();
+                }
+                pcmFilePath = "";
+            }
+        } catch (Exception e) {
+            logger.error("Error handling text message", e);
+        }
     }
 
+    private void stopSpeechRecognition() {
+        if (recognizer != null) {
+            try {
+                pushStream.close();
+                recognizer.stopContinuousRecognitionAsync().get();
+                recognizer.close();
+                recognizer = null;
+                pushStream = null;
+            } catch (Exception e) {
+                logger.error("Error stopping speech recognition", e);
+            }
+        }
+    }
 
+    private void startSpeechRecognition(WebSocketSession session) {
+        SpeechConfig speechConfig = SpeechConfig.fromSubscription(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION);
+        speechConfig.setSpeechRecognitionLanguage("en-US");
     
-    private byte[] convertWebMToPCMInMemory(byte[] webMData) throws IOException, InterruptedException {
-        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        
+        AudioStreamFormat audioFormat = AudioStreamFormat.getWaveFormatPCM((long)16000, (short)16, (short)1);
+        pushStream = PushAudioInputStream.createPushStream(audioFormat);
+        AudioConfig audioConfig = AudioConfig.fromStreamInput(pushStream);
+        recognizer = new SpeechRecognizer(speechConfig, audioConfig);
+    
+        recognizer.recognizing.addEventListener((s, e) -> {
+            logger.info("RECOGNIZING: Text={}", e.getResult().getText());
+
+            try {
+                //session.sendMessage(new TextMessage("Speech started"));
+                session.sendMessage(new TextMessage(e.getResult().getText()));
+            } catch (Exception ex) {
+                logger.error("Error sending message: {}", ex.getMessage());
+            }
+                        
+        });
+
+        recognizer.sessionStopped.addEventListener((s, e) -> {
+            logger.info("Session stopped.");
+        });
+    
+        recognizer.recognized.addEventListener((s, e) -> {
+            if (e.getResult().getReason() == ResultReason.RecognizedSpeech) {
+                String recognizedText = e.getResult().getText();
+                logger.info("RECOGNIZED: Text={}", recognizedText);
+                // Send the recognized text back to the client via WebSocket
+                try {
+                    session.sendMessage(new TextMessage("|"+recognizedText+"|"));
+                } catch (Exception ex) {
+                    logger.error("Error sending message: {}", ex.getMessage());
+                }
+            
+                logger.info("Speech ended");
+                try {
+                    session.sendMessage(new TextMessage("Speech ended"));
+                } catch (Exception ex) {
+                    logger.error("Error sending message: {}", ex.getMessage());
+                }
+                
+            } else if (e.getResult().getReason() == ResultReason.NoMatch) {
+                logger.warn("NOMATCH: Speech could not be recognized.");
+            }
+        });
+    
+        recognizer.canceled.addEventListener((s, e) -> {
+            logger.warn("CANCELED: Reason={}", e.getReason());
+            if (e.getReason() == CancellationReason.Error) {
+                logger.warn("CANCELED: ErrorCode={}", e.getErrorCode());
+                logger.warn("CANCELED: ErrorDetails={}", e.getErrorDetails());
+                logger.warn("CANCELED: Did you set the speech resource key and region values?");
+            }
+            // Stop continuous recognition if canceled
+            try {
+                recognizer.stopContinuousRecognitionAsync().get();
+            } catch (InterruptedException | ExecutionException ex) {
+                logger.error("Error stopping continuous recognition: {}", ex.getMessage());
+            }
+        });
+    
+        // Start continuous recognition
+        recognizer.startContinuousRecognitionAsync();
+    }
+
+
+    private byte[] convertFloatArrayToPCMInMemory(float[] floatData) throws IOException, InterruptedException {
         ProcessBuilder processBuilder = new ProcessBuilder(
             "ffmpeg",
+            "-f", "f32le", // Float32 little endian format
+            "-ar", "16000", // Sample rate 16000 Hz
+            "-ac", "1", // Number of audio channels
             "-i", "pipe:0", // Read input from stdin
             "-f", "s16le", // PCM format s16le (signed 16-bit little endian)
             "-acodec", "pcm_s16le", // Set audio codec to PCM signed 16-bit little endian
             "-ar", "16000", // Sample rate 16000 Hz
-            "-ac", "2", // Number of audio channels
+            "-ac", "1", // Number of audio channels
             "pipe:1" // Write output to stdout
         );
         
         Process process = processBuilder.start();
         
         try (OutputStream ffmpegInput = process.getOutputStream();
-             InputStream ffmpegOutput = process.getInputStream();
-             InputStream ffmpegError = process.getErrorStream()) {
+             InputStream ffmpegOutput = process.getInputStream()) {
             
-            // Write the WebM data to FFmpeg's input stream
-            ffmpegInput.write(webMData);
+            // Write the float array data to FFmpeg's input stream
+            byte[] byteData = new byte[floatData.length * 4]; // Each float is 4 bytes
+            ByteBuffer.wrap(byteData).asFloatBuffer().put(floatData);
+            ffmpegInput.write(byteData);
             ffmpegInput.flush();
             ffmpegInput.close();
             
-            // Read the PCM data from FFmpeg's output stream in a separate thread
-            Thread outputThread = new Thread(() -> {
-                try {
-                    byte[] buffer = new byte[4096];
-                    int bytesRead;
-                    while ((bytesRead = ffmpegOutput.read(buffer)) != -1) {
-                        outputStream.write(buffer, 0, bytesRead);
-                    }
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            });
-            outputThread.start();
+            // Read the PCM data from FFmpeg's output stream
+            byte[] pcmData = ffmpegOutput.readAllBytes();
             
-            // Capture and print FFmpeg's stderr output
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(ffmpegError))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    System.err.println(line);
-                }
-            }
-            
-            // Wait for the output thread to finish
-            outputThread.join();
-            
-        }
-        
-        int exitCode = process.waitFor();
-        if (exitCode == 0) {
-            System.out.println("In-memory conversion successful");
-        } else {
-            System.err.println("In-memory conversion failed");
-        }
-        
-        return outputStream.toByteArray();
-    }
-    
-    public void convertWebMToPCM(String webMFilePath, String pcmFilePath) {
-        ProcessBuilder processBuilder = new ProcessBuilder(
-            "ffmpeg", "-i", webMFilePath, 
-            "-f", "s16le", // PCM format s16le (signed 16-bit little endian)
-            "-acodec", "pcm_s16le", // Set audio codec to PCM signed 16-bit little endian
-            "-ar", "16000", // Sample rate 16000 Hz
-            "-ac", "1", // Number of audio channels
-            pcmFilePath);
-        try {
-            Process process = processBuilder.start();
             int exitCode = process.waitFor();
             if (exitCode == 0) {
-                System.out.println("Conversion successful");
+                System.out.println("In-memory conversion successful");
             } else {
-                System.err.println("Conversion failed");
+                System.err.println("In-memory conversion failed");
             }
-        } catch (IOException | InterruptedException e) {
-            e.printStackTrace();
+            
+            return pcmData;
         }
     }
-
-    private byte[] loadPcmFileIntoMemory(String pcmFilePath) throws IOException {
-        File pcmFile = new File(pcmFilePath);
-        if (!pcmFile.exists() || pcmFile.isDirectory()) {
-            throw new FileNotFoundException("PCM file not found at " + pcmFilePath);
-        }
-        
-        long fileSize = pcmFile.length();
-        if (fileSize > Integer.MAX_VALUE) {
-            throw new IOException("PCM file is too large to fit into a byte array.");
-        }
     
-        byte[] audioData = new byte[(int) fileSize];
-        
-        try (FileInputStream fis = new FileInputStream(pcmFile)) {
-            int bytesRead = fis.read(audioData);
-            if (bytesRead != fileSize) {
-                throw new IOException("Failed to read the entire PCM file into memory. Expected bytes: " + fileSize + ", Read bytes: " + bytesRead);
-            }
-        } catch (IOException e) {
-            throw new IOException("Error occurred while reading PCM file into memory.", e);
-        }
-        
-        return audioData;
-    }
-
-    protected void handleBinaryMessageWithFileConversion(WebSocketSession session, BinaryMessage message) throws Exception {
-        byte[] audioData = message.getPayload().array();
-        
-        System.out.println("Received audio data size: " + audioData.length + " bytes");
-
-        File tempWebMFile = File.createTempFile("audio", ".webm");
-        try (FileOutputStream fos = new FileOutputStream(tempWebMFile)) {
-            fos.write(audioData);
-            System.out.println("Temporary WebM file path: " + tempWebMFile.getAbsolutePath());
-            fos.close();
-        } catch (IOException e) {
-            e.printStackTrace();
-            return;
-        }
-
-        System.out.println("Converting WebM to PCM...");
-        // Check if the file exists, and delete it if it does
-        File outputPcmFile = new File("output_audio_3.pcm");
-        if(outputPcmFile.exists()) {
-            boolean isDeleted = outputPcmFile.delete();
-            if(isDeleted) {
-                System.out.println("Existing file deleted successfully.");
-            } else {
-                System.out.println("Failed to delete the existing file.");
-            }
-        }
-        
-        extractPcmFromWebM(tempWebMFile.getAbsolutePath(), outputPcmFile.getAbsolutePath());
-
-        System.out.println("Output PCM file path: " + outputPcmFile.getAbsolutePath());
-
-        if (!tempWebMFile.delete()) {
-            System.err.println("Failed to delete temporary file: " + tempWebMFile.getAbsolutePath());
-        }
-
-        // Loading the PCM file into memory
-        byte[] pcmDataBytes = loadPcmFileIntoMemory(outputPcmFile.getAbsolutePath());
-        System.out.println("Loaded PCM data into memory. Size: " + pcmDataBytes.length + " bytes");
-
-        // Now that we have the PCM file, transcribe it
-        transcribePcmData(session, pcmDataBytes);
-    }
-
-    private void extractPcmFromWebM(String inputFilePath, String outputFilePath) {
-        try {
-            // Construct the FFmpeg command
-            String ffmpegCommand = "ffmpeg -i " + inputFilePath + " -f s16le -acodec pcm_s16le " + outputFilePath;
-
-            // Create a ProcessBuilder to execute the FFmpeg command
-            ProcessBuilder processBuilder = new ProcessBuilder(ffmpegCommand.split(" "));
-
-            // Start the FFmpeg process
-            Process process = processBuilder.start();
-
-            // Read the output of the FFmpeg process
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                System.out.println(line);
-            }
-
-            // Wait for the FFmpeg process to complete
-            int exitCode = process.waitFor();
-
-            if (exitCode == 0) {
-                System.out.println("WebM to PCM conversion completed.");
-            } else {
-                System.out.println("WebM to PCM conversion failed with exit code: " + exitCode);
-            }
-        } catch (IOException | InterruptedException e) {
-            e.printStackTrace();
-        }
-    }
-
     private void transcribePcmData(WebSocketSession session, byte[] pcmDataBytes) {
         System.out.println("Transcribing PCM data bytes");
 
@@ -353,45 +376,19 @@ public class AudioWebSocketHandler extends BinaryWebSocketHandler {
 
 
     }
- 
 
-
-    private void recognizeSpeech(WebSocketSession session, byte[] audioData) {
-        try {
-            SpeechConfig speechConfig = SpeechConfig.fromSubscription(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION);
-            speechConfig.setSpeechRecognitionLanguage("en-US");
-
-            AudioStreamFormat audioFormat = AudioStreamFormat.getWaveFormatPCM((long)16000, (short)16, (short)1);
-            PushAudioInputStream pushStream = PushAudioInputStream.createPushStream(audioFormat);
-
-            pushStream.write(audioData);
-            pushStream.close();
-
-            AudioConfig audioConfig = AudioConfig.fromStreamInput(pushStream);
-            SpeechRecognizer recognizer = new SpeechRecognizer(speechConfig, audioConfig);
-            Future<SpeechRecognitionResult> task = recognizer.recognizeOnceAsync();
-            SpeechRecognitionResult result = task.get();
-
-            if (result.getReason() == ResultReason.RecognizedSpeech) {
-                String recognizedText = result.getText();
-                session.sendMessage(new org.springframework.web.socket.TextMessage(recognizedText));
-            } else {
-                logger.warn("Speech recognition failed: {}", result.getReason());
-            }
-        } catch (InterruptedException | ExecutionException | IOException e) {
-            logger.error("Error during speech recognition: {}", e.getMessage());
-        }
-    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         logger.info("WebSocket connection established: {}", session);
         session.setTextMessageSizeLimit(1024 * 1024); // 1MB
         session.setBinaryMessageSizeLimit(1024 * 1024); // 1MB
+        startFFmpegProcess();
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         logger.info("WebSocket connection closed: {} - {}", session, status);
+        stopFFmpegProcess(); 
     }
 }

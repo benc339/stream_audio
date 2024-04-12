@@ -1,0 +1,145 @@
+
+    private byte[] convertFloatToPCM(float[] floatData) {
+        byte[] pcmData = new byte[floatData.length * 2]; // Each PCM sample is 2 bytes (16 bits)
+        for (int i = 0; i < floatData.length; i++) {
+            int sample = (int) (floatData[i] * 32767); // Convert float to 16-bit signed integer
+            pcmData[i * 2] = (byte) (sample & 0xff); // Little-endian byte order
+            pcmData[i * 2 + 1] = (byte) ((sample >> 8) & 0xff);
+        }
+        return pcmData;
+    }
+
+    private byte[] convertFloatArrayToPCMInMemory(float[] floatData) throws IOException, InterruptedException {
+        // Write the float array data to FFmpeg's input stream
+        byte[] byteData = new byte[floatData.length * 4];  // Each float is 4 bytes
+        ByteBuffer.wrap(byteData).asFloatBuffer().put(floatData);
+        ffmpegInput.write(byteData);
+        ffmpegInput.flush();
+        ffmpegInput.close();
+    
+        // Read the PCM data from FFmpeg's output stream in a separate thread
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        Thread outputThread = new Thread(() -> {
+            try {
+                InputStream ffmpegOutput = ffmpegProcess.getInputStream();
+                byte[] buffer = new byte[4096];
+                int bytesRead;
+                while ((bytesRead = ffmpegOutput.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+        outputThread.start();
+    
+        // Capture and print FFmpeg's stderr output (optional)
+        Thread errorThread = new Thread(() -> {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(ffmpegProcess.getErrorStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.err.println(line);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+        errorThread.start();
+    
+        // Wait for the output thread to finish
+        outputThread.join();
+    
+        // Wait for the error thread to finish (optional)
+        errorThread.join();
+    
+        return outputStream.toByteArray();
+    }
+
+    private byte[] convertFloatArrayToPCM(float[] floatData) {
+        byte[] pcmData = new byte[floatData.length * (BITS_PER_SAMPLE / 8)];
+        int index = 0;
+        
+        for (float sample : floatData) {
+            // Scale the float sample to the range of a signed 16-bit integer
+            int scaledSample = (int) (sample * Short.MAX_VALUE);
+            
+            // Clamp the scaled sample to the valid range
+            short clampedSample = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, scaledSample));
+            
+            // Convert the clamped sample to bytes
+            byte[] sampleBytes = shortToBytes(clampedSample, IS_LITTLE_ENDIAN);
+            
+            // Copy the sample bytes to the PCM data array
+            System.arraycopy(sampleBytes, 0, pcmData, index, sampleBytes.length);
+            index += sampleBytes.length;
+        }
+        
+        return pcmData;
+    }
+    
+    private byte[] shortToBytes(short value, boolean isLittleEndian) {
+        byte[] bytes = new byte[2];
+        if (isLittleEndian) {
+            bytes[0] = (byte) (value & 0xFF);
+            bytes[1] = (byte) ((value >> 8) & 0xFF);
+        } else {
+            bytes[0] = (byte) ((value >> 8) & 0xFF);
+            bytes[1] = (byte) (value & 0xFF);
+        }
+        return bytes;
+    }
+
+
+    private byte[] convertFloatArrayToPCM(float[] floatData, int sampleRate, int bitsPerSample, boolean isLittleEndian) {
+        int bytesPerSample = bitsPerSample / 8;
+        ByteBuffer byteBuffer = ByteBuffer.allocate(floatData.length * bytesPerSample);
+        byteBuffer.order(isLittleEndian ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN);
+    
+        for (float sample : floatData) {
+            // Scale the float sample to the range of the specified bits per sample
+            double maxSampleValue = Math.pow(2, bitsPerSample - 1) - 1;
+            double scaledSample = sample * maxSampleValue;
+    
+            // Clamp the scaled sample to the valid range
+            double clampedSample = Math.max(-maxSampleValue - 1, Math.min(maxSampleValue, scaledSample));
+    
+            // Convert the clamped sample to integer
+            int intSample = (int) Math.round(clampedSample);
+    
+            // Put the sample value into the byte buffer
+            switch (bytesPerSample) {
+                case 1:
+                    byteBuffer.put((byte) intSample);
+                    break;
+                case 2:
+                    byteBuffer.putShort((short) intSample);
+                    break;
+                case 3:
+                    byteBuffer.put((byte) (intSample >> 16));
+                    byteBuffer.put((byte) (intSample >> 8));
+                    byteBuffer.put((byte) intSample);
+                    break;
+                case 4:
+                    byteBuffer.putInt(intSample);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported bytes per sample: " + bytesPerSample);
+            }
+        }
+    
+        return byteBuffer.array();
+    }
+
+
+    public static byte[] floatToPcm16(float[] floatArray) {
+        byte[] pcmData = new byte[floatArray.length * 2]; // 16-bit PCM, so 2 bytes per sample
+        int index = 0;
+        for (float sample : floatArray) {
+            // Scale float from -1.0f..1.0f to the 16-bit PCM range and clamp
+            int nSample = Math.max(Math.min((int)(sample * 32767.0f), 32767), -32768);
+            // Convert to bytes and store in the array
+            pcmData[index++] = (byte) (nSample & 0xFF);
+            pcmData[index++] = (byte) ((nSample >> 8) & 0xFF);
+        }
+        return pcmData;
+    }
