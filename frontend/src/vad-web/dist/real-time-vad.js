@@ -16,7 +16,7 @@ export const defaultRealTimeVADOptions = {
         log.debug("Detected speech end");
     },
     onAudioFrame: (audioFrame) => {
-        console.log("Received an audio frame");
+        //console.log("Received an audio frame");
     },
     workletURL: assetPath("vad.worklet.bundle.min.js"),
     modelURL: assetPath("silero_vad.onnx"),
@@ -156,8 +156,10 @@ export class AudioNodeVAD {
         this.processFrame = async (frame) => {
             const ev = await this.frameProcessor.process(frame);
             this.handleFrameProcessorEvent(ev);
-            // Invoke the onAudioFrame callback with the current frame
-            this.options.onAudioFrame(frame);
+            // Invoke the onAudioFrame callback only if speech is active
+            if (this.isSpeechActive && this.options.onAudioFrame) {
+                this.options.onAudioFrame(frame);
+            }
         };
         this.handleFrameProcessorEvent = (ev) => {
             if (ev.probs !== undefined) {
@@ -165,12 +167,14 @@ export class AudioNodeVAD {
             }
             switch (ev.msg) {
                 case Message.SpeechStart:
+                    this.isSpeechActive = true;
                     this.options.onSpeechStart();
                     break;
                 case Message.VADMisfire:
                     this.options.onVADMisfire();
                     break;
                 case Message.SpeechEnd:
+                    this.isSpeechActive = false;
                     this.options.onSpeechEnd(ev.audio);
                     break;
                 default:
@@ -183,5 +187,6 @@ export class AudioNodeVAD {
             });
             this.entryNode.disconnect();
         };
+        this.isSpeechActive = false;
     }
 }

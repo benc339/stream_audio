@@ -12,22 +12,33 @@ const AudioStreamer: React.FC = () => {
     
     const initializeMicVAD = async () => {
       const myvad = await MicVAD.new({
+        
+        onSpeechStart: () => {
+          console.log("User started talking");
+          //startAudioCapture();
+          if (socketRef.current) {
+            socketRef.current.send('start');
+          }
+          
+        },
         onSpeechEnd: (audio: Float32Array) => {
           // do something with `audio` (Float32Array of audio samples at sample rate 16000)...
+          socketRef.current.send('stop');
           console.log('Speech end')
           console.log(audio.length)
         },
         onAudioFrame: (audioFrame) => {
-          console.log("Audio frame received", audioFrame);
+          //console.log("Audio frame received");
+          socketRef.current.send(audioFrame);
           // Process the audio frame as needed
         },
       });
       myvad.start();
+      console.log('Start');
       // Any other asynchronous operations
       
     };
     
-
     const connectWebSocket = () => {
       socketRef.current = new WebSocket('ws://localhost:8080/audio');
       socketRef.current.onopen = () => {

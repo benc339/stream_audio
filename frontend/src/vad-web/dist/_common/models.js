@@ -1,5 +1,4 @@
 var _a;
-// @ts-ignore
 import { log } from "./logging";
 export class Silero {
     constructor(ort, modelFetcher) {

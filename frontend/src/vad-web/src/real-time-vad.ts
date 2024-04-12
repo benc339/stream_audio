@@ -81,13 +81,14 @@ export const defaultRealTimeVADOptions: RealTimeVADOptions = {
     log.debug("VAD misfire")
   },
   onSpeechStart: () => {
+    
     log.debug("Detected speech start")
   },
   onSpeechEnd: () => {
     log.debug("Detected speech end")
   },
   onAudioFrame: (audioFrame) => {
-    console.log("Received an audio frame");
+    //console.log("Received an audio frame");
   },
   workletURL: assetPath("vad.worklet.bundle.min.js"),
   modelURL: assetPath("silero_vad.onnx"),
@@ -168,6 +169,8 @@ export class MicVAD {
 }
 
 export class AudioNodeVAD {
+  private isSpeechActive: boolean;
+
   static async new(
     ctx: AudioContext,
     options: Partial<RealTimeVADOptions> = {}
@@ -254,7 +257,9 @@ export class AudioNodeVAD {
     public options: RealTimeVADOptions,
     private frameProcessor: FrameProcessor,
     private entryNode: AudioWorkletNode
-  ) {}
+  ) {
+    this.isSpeechActive = false;
+  }
 
   pause = () => {
     const ev = this.frameProcessor.pause()
@@ -273,8 +278,10 @@ export class AudioNodeVAD {
     const ev = await this.frameProcessor.process(frame)
     this.handleFrameProcessorEvent(ev)
 
-    // Invoke the onAudioFrame callback with the current frame
-    this.options.onAudioFrame(frame);
+     // Invoke the onAudioFrame callback only if speech is active
+     if (this.isSpeechActive && this.options.onAudioFrame) {
+      this.options.onAudioFrame(frame);
+    }
   }
 
   handleFrameProcessorEvent = (
@@ -289,6 +296,7 @@ export class AudioNodeVAD {
     }
     switch (ev.msg) {
       case Message.SpeechStart:
+        this.isSpeechActive = true
         this.options.onSpeechStart()
         break
 
@@ -297,6 +305,7 @@ export class AudioNodeVAD {
         break
 
       case Message.SpeechEnd:
+        this.isSpeechActive = false
         this.options.onSpeechEnd(ev.audio as Float32Array)
         break
 

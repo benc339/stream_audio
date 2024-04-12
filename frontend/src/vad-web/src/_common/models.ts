@@ -1,4 +1,4 @@
-// @ts-ignore
+
 import { log } from "./logging"
 
 export type ONNXRuntimeAPI = any
